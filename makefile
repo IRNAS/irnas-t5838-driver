@@ -22,29 +22,26 @@
 # <project_name>/project.
 
 install-dep:
-	# Install gcc-multilib for 32-bit support
-	sudo apt-get update
-	sudo apt-get install gcc-multilib
-	pip install -r scripts/requirements.txt
-	east sys-setup
+	east install nrfutil-toolchain-manager
 	# Below line is needed, as the toolchain manager might be cached in CI, but not configured
-	~/.local/share/east/nrfutil-toolchain-manager.exe config --install-dir ~/.local/share/east
-
-install-test-dep:
-	sudo apt-get install gcc-multilib lcov
-	pip install junit2html
+	~/.local/share/east/tooling/nrfutil/nrfutil-toolchain-manager.exe config --install-dir ~/.local/share/east
 
 project-setup:
 	# Make a West workspace around this project
-	west init -l .
+	east init -l .
 	# Use a faster update method
-	west update -o=--depth=1 -n
-	east update toolchain
+	east update -o=--depth=1 -n
+	east install toolchain
 
 pre-build:
 	echo "Pre-build"
 
-build:
+# Runs on every push to the main branch
+quick-build:
+	east build -b nrf52840dk_nrf52840 app
+
+# Runs on every PR and when doing releases
+release:
 	# Change east.yml to control what is built.
 	east release
 
@@ -61,7 +58,8 @@ test:
 test-report-ci:
 	junit2html twister-out/twister.xml twister-out/twister-report.html
 
-# Intended to be used by developer
+# Intended to be used by developer, use 'pip install junit2html' to install
+# tooling
 test-report: test-report-ci
 	firefox twister-out/twister-report.html
 
@@ -81,3 +79,28 @@ coverage-report-ci:
 coverage-report: coverage-report-ci
 	genhtml -q --output-directory twister-out/coverage --ignore-errors source --branch-coverage --highlight --legend twister-out/coverage.info
 	firefox twister-out/coverage/index.html
+
+# CodeChecker section
+# build and check targets are run on every push to the `main` and in PRs.
+# store target is run only on the push to `main`.
+# diff target is run only in PRs.
+#
+# Important: If building more projects, make sure to create separate build
+# directories with -d flag, so they can be analyzed separately, see examples
+# below.
+codechecker-build:
+	east build -b nrf52840dk_nrf52840 app -d build_app
+	east build -b nrf52840dk_nrf52840 app -u debug -d build_debug
+
+codechecker-check:
+	east codechecker check -d build_app
+	east codechecker check -d build_debug
+
+codechecker-store:
+	east codechecker store -d build_app
+	east codechecker store -d build_debug
+
+# Specify build folders that you want to analyze to the script as positional 
+# arguments, open it to learn more.
+codechecker-diff:
+	scripts/codechecker-diff.sh build_app build_debug
