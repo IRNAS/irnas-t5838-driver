@@ -4,15 +4,45 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "t5838.h"
+
 #include <zephyr/audio/dmic.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <hal/nrf_gpio.h>
 #include <nrfx_pdm.h>
 #include <soc.h>
 
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(t5838, CONFIG_AUDIO_DMIC_LOG_LEVEL);
+LOG_MODULE_REGISTER(t5838, CONFIG_T5838_LOG_LEVEL);
+
+#ifdef CONFIG_AUDIO_DMIC_NRFX_PDM
+BUILD_ASSERT(CONFIG_AUDIO_DMIC_NRFX_PDM == 0,
+	     "Both T5838 and nrfx_pdm drivers enabled, set "
+	     "CONFIG_AUDIO_DMIC_NRFX_PDM to false to use T5838 driver");
+#endif
+
+#define DT_DRV_COMPAT tdk_t5838_nrf_pdm
+
+const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+
+/* We use any instance macro here, despite driver only supports single PDM microphone */
+#define T5838_INST_HAS_MICEN_OR(inst) DT_INST_NODE_HAS_PROP(inst, micen_gpios) ||
+#define T5838_ANY_INST_HAS_MICEN      DT_INST_FOREACH_STATUS_OKAY(T5838_INST_HAS_MICEN_OR) 0
+
+#define T5838_INST_HAS_THSEL_OR(inst) DT_INST_NODE_HAS_PROP(inst, thsel_gpios) ||
+#define T5838_ANY_INST_HAS_THSEL      DT_INST_FOREACH_STATUS_OKAY(T5838_INST_HAS_THSEL_OR) 0
+
+#define T5838_INST_HAS_WAKE_OR(inst) DT_INST_NODE_HAS_PROP(inst, wake_gpios) ||
+#define T5838_ANY_INST_HAS_WAKE	     DT_INST_FOREACH_STATUS_OKAY(T5838_INST_HAS_WAKE_OR) 0
+
+#define T5838_INST_HAS_PDMCLK_OR(inst) DT_INST_NODE_HAS_PROP(inst, pdmclk_gpios) ||
+#define T5838_ANY_INST_HAS_PDMCLK      DT_INST_FOREACH_STATUS_OKAY(T5838_INST_HAS_WAKE_OR) 0
+
+#define T5838_ANY_INST_AAD_CAPABLE                                                                 \
+	T5838_ANY_INST_HAS_THSEL &&T5838_ANY_INST_HAS_WAKE &&T5838_ANY_INST_HAS_PDMCLK
 
 struct t5838_drv_data {
 	struct onoff_manager *clk_mgr;
@@ -24,6 +54,17 @@ struct t5838_drv_data {
 	bool configured : 1;
 	volatile bool active;
 	volatile bool stopping;
+
+/* T5838 specific data */
+#if T5838_ANY_INST_AAD_CAPABLE
+	struct t5838_thconf thconf;
+	bool aad_enabled;
+
+	struct gpio_callback wake_cb;
+	bool cb_configured;
+	bool int_handled;
+	t5838_wake_handler_t wake_handler;
+#endif
 };
 
 struct t5838_drv_cfg {
@@ -35,7 +76,472 @@ struct t5838_drv_cfg {
 		PCLK32M_HFXO,
 		ACLK
 	} clk_src;
+
+/* T5838 specific config */
+#if T5838_ANY_INST_HAS_MICEN
+	const struct gpio_dt_spec *micen;
+#endif
+#if T5838_ANY_INST_HAS_WAKE
+	const struct gpio_dt_spec *wake;
+#endif
+#if T5838_ANY_INST_HAS_THSEL
+	const struct gpio_dt_spec *thsel;
+#endif
+#if T5838_ANY_INST_HAS_PDMCLK
+	const struct gpio_dt_spec *pdmclk;
+#endif
 };
+
+/**
+ * @brief Function for writing to T5838 registers using their proprietary "one wire" that isn't
+ * really one wire. We refer to this protocol as fake2c to avoid confusion with actual one wire
+ * protocol.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param reg Register address to write to.
+ * @param data Data to write to register.
+ *
+ * @retval 0 If successful.
+ */
+int prv_t5838_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	struct t5838_drv_data *drv_data = dev->data;
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	int err;
+	/** Make sure there is no PDM transfer in progress, and we can take clock signal */
+	if (drv_data->active) {
+		LOG_ERR("Cannot write to device while pdm is active");
+		return -EBUSY;
+	}
+
+	/**prepare data */
+	uint8_t wr_buf[] = {T5838_FAKE2C_DEVICE_ADDRESS << 1, reg, data
+
+	};
+	/* put into wr_buf since it gets written first */
+	uint8_t cyc_buf;
+
+	/** start with thsel low */
+	err = gpio_pin_set_dt(drv_cfg->thsel, 0);
+	if (err < 0) {
+		LOG_ERR("gpio_pin_set_dt, err: %d", err);
+		return err;
+	}
+	/** Clock device before writing to prepare device for communication */
+
+	for (int i = 0; i < T5838_FAKE2C_PRE_WRITE_CYCLES; i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+	}
+	/** write start condition*/
+	err = gpio_pin_set_dt(drv_cfg->thsel, 1);
+	if (err < 0) {
+		LOG_ERR("gpio_pin_set_dt, err: %d", err);
+		return err;
+	}
+	for (int i = 0; i < T5838_FAKE2C_START_PILOT_CLKS; i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+	}
+	/** write first space before writing data */
+	err = gpio_pin_set_dt(drv_cfg->thsel, 0);
+	if (err < 0) {
+		LOG_ERR("gpio_pin_set_dt, err: %d", err);
+		return err;
+	}
+	for (int i = 0; i < T5838_FAKE2C_SPACE; i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+	}
+	/** write data */
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 8; j++) {
+
+			if (wr_buf[i] & BIT(7 - j)) {
+				/* sending one */
+				cyc_buf = T5838_FAKE2C_ONE;
+			} else {
+				/* sending 0 */
+				cyc_buf = T5838_FAKE2C_ZERO;
+			}
+			/** Send data bit */
+			err = gpio_pin_set_dt(drv_cfg->thsel, 1);
+			if (err < 0) {
+				LOG_ERR("gpio_pin_set_dt, err: %d", err);
+				return err;
+			}
+			for (int k = 0; k < cyc_buf; k++) {
+				err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+				if (err < 0) {
+					LOG_ERR("gpio_pin_set_dt, err: %d", err);
+					return err;
+				}
+				k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+				err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+				if (err < 0) {
+					LOG_ERR("gpio_pin_set_dt, err: %d", err);
+					return err;
+				}
+				k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+			}
+			/** Send space */
+			err = gpio_pin_set_dt(drv_cfg->thsel, 0);
+			if (err < 0) {
+				LOG_ERR("gpio_pin_set_dt, err: %d", err);
+				return err;
+			}
+			for (int k = 0; k < T5838_FAKE2C_SPACE; k++) {
+				err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+				if (err < 0) {
+					LOG_ERR("gpio_pin_set_dt, err: %d", err);
+					return err;
+				}
+				k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+				err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+				if (err < 0) {
+					LOG_ERR("gpio_pin_set_dt, err: %d", err);
+					return err;
+				}
+				k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+			}
+		}
+	}
+	/**write stop condition */
+	err = gpio_pin_set_dt(drv_cfg->thsel, 1);
+	if (err < 0) {
+		LOG_ERR("gpio_pin_set_dt, err: %d", err);
+		return err;
+	}
+	for (int i = 0; i < T5838_FAKE2C_STOP; i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+	}
+	err = gpio_pin_set_dt(drv_cfg->thsel, 0);
+	if (err < 0) {
+		LOG_ERR("gpio_pin_set_dt, err: %d", err);
+		return err;
+	}
+
+	/**keep clock to apply */
+	for (int i = 0; i < T5838_FAKE2C_POST_WRITE_CYCLES; i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_FAKE2C_CLK_PERIOD_US / 2);
+	}
+	return 0;
+#endif
+}
+
+/**
+ * @brief Function for putting T5838 into sleep mode with AAD is enabled. Must be called after
+ * writing to AAD registers.
+ *
+ * function clocks device for value set in T5838_ENTER_SLEEP_MODE_CLOCKING_TIME_uS to enable AAD.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ *
+ * @retval 0 If successful.
+ */
+int prv_t5838_enter_sleep_with_AAD(const struct device *dev)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	int err;
+	for (int i = 0;
+	     i < T5838_ENTER_SLEEP_MODE_CLOCKING_TIME_uS / T5838_ENTER_SLEEP_MODE_CLK_PERIOD_uS;
+	     i++) {
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 1);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_ENTER_SLEEP_MODE_CLK_PERIOD_uS / 2);
+		err = gpio_pin_set_dt(drv_cfg->pdmclk, 0);
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+		k_busy_wait(T5838_ENTER_SLEEP_MODE_CLK_PERIOD_uS / 2);
+	}
+	return 0;
+#endif
+}
+
+#if T5838_ANY_INST_AAD_CAPABLE
+
+/** this are here because we need to access device struct from callback handler which uses different
+ * device context */
+const struct t5838_drv_cfg *g_drv_cfg = NULL;
+struct t5838_drv_data *g_drv_data = NULL;
+static void prv_wake_cb_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	if (g_drv_data->int_handled) {
+		return;
+	}
+	g_drv_data->int_handled = true;
+	int err = 0;
+	err = gpio_pin_interrupt_configure_dt(g_drv_cfg->wake, GPIO_INT_DISABLE);
+	if (err) {
+		LOG_ERR("gpio_pin_interrupt_configure, err: %d", err);
+		return;
+	}
+	LOG_INF("WAKE PIN INTERRUPT");
+
+	if (g_drv_data->wake_handler) {
+		g_drv_data->wake_handler(dev);
+	}
+}
+#endif
+
+int t5838_wake_clear(const struct device *dev)
+{
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+	if (drv_data->cb_configured) {
+		err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+		if (err) {
+			LOG_ERR("gpio_pin_interrupt_configure, err: %d", err);
+			return err;
+		}
+	}
+	drv_data->int_handled = false;
+	return 0;
+}
+
+void t5838_wake_handler_set(const struct device *dev, t5838_wake_handler_t handler)
+{
+	struct t5838_drv_data *drv_data = dev->data;
+	drv_data->wake_handler = handler;
+}
+
+int t5838_AAD_configure(const struct device *dev, struct t5838_thconf *thconf)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+	/** Make sure there is no PDM transfer in progress, and we can take clock signal */
+	if (drv_data->active) {
+		LOG_ERR("Cannot write to device while pdm is active");
+		return -EBUSY;
+	}
+
+	/** if AAD mode is selected, first write unlock sequence */
+	if (thconf->aad_select != T5838_AAD_SELECT_NONE && drv_data->aad_enabled == false) {
+		/** This is unlock sequence for AAD modes provided in datasheet. */
+		err = prv_t5838_reg_write(dev, 0x5C, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x3E, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x6F, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x3B, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x4C, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		drv_data->aad_enabled = true;
+	}
+	/** Set AAD mode to zero while we configure device to avoid problems */
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	switch (thconf->aad_select) {
+	case T5838_AAD_SELECT_A:
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_LPF, thconf->aad_a_lpf);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_THR, thconf->aad_a_thr);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, thconf->aad_select);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_enter_sleep_with_AAD(dev);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		break;
+	case T5838_AAD_SELECT_D1:
+	case T5838_AAD_SELECT_D2:
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO,
+					  thconf->aad_d_abs_thr & 0xFF);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
+					  (thconf->aad_d_abs_thr >> 8) & 0x1F);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO,
+					  thconf->aad_d_floor & 0xFF);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
+					  (thconf->aad_d_floor >> 8) & 0x1F);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
+					  thconf->aad_d_rel_pulse_min & 0xFF);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
+					  ((thconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
+						  (thconf->aad_d_rel_pulse_min & 0x0F));
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
+					  thconf->aad_d_abs_pulse_min & 0xFF);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, thconf->aad_d_rel_thr);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+
+		err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, thconf->aad_select);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_enter_sleep_with_AAD(dev);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		break;
+	case T5838_AAD_SELECT_NONE:
+		return 0;
+		break;
+	default:
+		/* This means invalid AAD mode value was selected */
+		return -EINVAL;
+		break;
+	}
+
+	/* configure interrupt */
+	if (thconf->aad_select != T5838_AAD_SELECT_NONE) {
+		drv_data->int_handled = false;
+		gpio_init_callback(&drv_data->wake_cb, prv_wake_cb_handler,
+				   BIT(drv_cfg->wake->pin));
+
+		err = gpio_add_callback(drv_cfg->wake->port, &drv_data->wake_cb);
+		if (err) {
+			LOG_ERR("gpio_add_callback, err: %d", err);
+			return err;
+		}
+		err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+		if (err) {
+			LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+			return err;
+		}
+		drv_data->cb_configured = true;
+		g_drv_data = drv_data;
+		g_drv_cfg = drv_cfg;
+	}
+	return 0;
+#endif
+}
+
+/** From here bellow this is mostly modified copy of zephyr nrf pdm driver */
 
 static void free_buffer(struct t5838_drv_data *drv_data, void *buffer)
 {
@@ -113,6 +619,8 @@ static bool is_better(uint32_t freq, uint8_t ratio, uint32_t req_rate, uint32_t 
 	return false;
 }
 
+/** This function was modified to no longer check if we are using nrf52 and locking pdm clock to
+ * discrete enumerated values */
 static bool check_pdm_frequencies(const struct t5838_drv_cfg *drv_cfg, nrfx_pdm_config_t *config,
 				  const struct dmic_cfg *pdm_cfg, uint8_t ratio,
 				  uint32_t *best_diff, uint32_t *best_rate, uint32_t *best_freq)
@@ -120,86 +628,33 @@ static bool check_pdm_frequencies(const struct t5838_drv_cfg *drv_cfg, nrfx_pdm_
 	uint32_t req_rate = pdm_cfg->streams[0].pcm_rate;
 	bool better_found = false;
 
-	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF53X)) {
-		const uint32_t src_freq =
-			(NRF_PDM_HAS_MCLKCONFIG && drv_cfg->clk_src == ACLK)
-				/* The DMIC_NRFX_PDM_DEVICE() macro contains build
-				 * assertions that make sure that the ACLK clock
-				 * source is only used when it is available and only
-				 * with the "hfclkaudio-frequency" property defined,
-				 * but the default value of 0 here needs to be used
-				 * to prevent compilation errors when the property is
-				 * not defined (this expression will be eventually
-				 * optimized away then).
-				 */
-				? DT_PROP_OR(DT_NODELABEL(clock), hfclkaudio_frequency, 0)
-				: 32 * 1000 * 1000UL;
-		uint32_t req_freq = req_rate * ratio;
-		/* As specified in the nRF5340 PS:
-		 *
-		 * PDMCLKCTRL = 4096 * floor(f_pdm * 1048576 /
-		 *                           (f_source + f_pdm / 2))
-		 * f_actual = f_source / floor(1048576 * 4096 / PDMCLKCTRL)
-		 */
-		uint32_t clk_factor =
-			(uint32_t)((req_freq * 1048576ULL) / (src_freq + req_freq / 2));
-		uint32_t act_freq = src_freq / (1048576 / clk_factor);
+	const uint32_t src_freq = (NRF_PDM_HAS_MCLKCONFIG && drv_cfg->clk_src == ACLK)
+					  /* The DMIC_NRFX_PDM_DEVICE() macro contains build
+					   * assertions that make sure that the ACLK clock
+					   * source is only used when it is available and only
+					   * with the "hfclkaudio-frequency" property defined,
+					   * but the default value of 0 here needs to be used
+					   * to prevent compilation errors when the property is
+					   * not defined (this expression will be eventually
+					   * optimized away then).
+					   */
+					  ? DT_PROP_OR(DT_NODELABEL(clock), hfclkaudio_frequency, 0)
+					  : 32 * 1000 * 1000UL;
+	uint32_t req_freq = req_rate * ratio;
+	/* As specified in the nRF5340 PS:
+	 *
+	 * PDMCLKCTRL = 4096 * floor(f_pdm * 1048576 /
+	 *                           (f_source + f_pdm / 2))
+	 * f_actual = f_source / floor(1048576 * 4096 / PDMCLKCTRL)
+	 */
+	uint32_t clk_factor = (uint32_t)((req_freq * 1048576ULL) / (src_freq + req_freq / 2));
+	uint32_t act_freq = src_freq / (1048576 / clk_factor);
 
-		if (act_freq >= pdm_cfg->io.min_pdm_clk_freq &&
-		    act_freq <= pdm_cfg->io.max_pdm_clk_freq &&
-		    is_better(act_freq, ratio, req_rate, best_diff, best_rate, best_freq)) {
-			config->clock_freq = clk_factor * 4096;
+	if (act_freq >= pdm_cfg->io.min_pdm_clk_freq && act_freq <= pdm_cfg->io.max_pdm_clk_freq &&
+	    is_better(act_freq, ratio, req_rate, best_diff, best_rate, best_freq)) {
+		config->clock_freq = clk_factor * 4096;
 
-			better_found = true;
-		}
-	} else { /* -> !IS_ENABLED(CONFIG_SOC_SERIES_NRF53X)) */
-		static const struct {
-			uint32_t freq_val;
-			nrf_pdm_freq_t freq_enum;
-		} freqs[] = {
-			{1000000, NRF_PDM_FREQ_1000K},
-			{1032000, NRF_PDM_FREQ_1032K},
-			{1067000, NRF_PDM_FREQ_1067K},
-#if defined(PDM_PDMCLKCTRL_FREQ_1231K)
-			{1231000, NRF_PDM_FREQ_1231K},
-#endif
-#if defined(PDM_PDMCLKCTRL_FREQ_1280K)
-			{1280000, NRF_PDM_FREQ_1280K},
-#endif
-#if defined(PDM_PDMCLKCTRL_FREQ_1333K)
-			{1333000, NRF_PDM_FREQ_1333K}
-#endif
-		};
-
-		for (int i = 0; i < ARRAY_SIZE(freqs); ++i) {
-			uint32_t freq_val = freqs[i].freq_val;
-
-			if (freq_val < pdm_cfg->io.min_pdm_clk_freq) {
-				continue;
-			}
-			if (freq_val > pdm_cfg->io.max_pdm_clk_freq) {
-				break;
-			}
-
-			if (is_better(freq_val, ratio, req_rate, best_diff, best_rate, best_freq)) {
-				config->clock_freq = freqs[i].freq_enum;
-
-				/* Stop if an exact rate match is found. */
-				if (*best_diff == 0) {
-					return true;
-				}
-
-				better_found = true;
-			}
-
-			/* Since frequencies are are in ascending order, stop
-			 * checking next ones for the current ratio after
-			 * resulting PCM rate goes above the one requested.
-			 */
-			if ((freq_val / ratio) > req_rate) {
-				break;
-			}
-		}
+		better_found = true;
 	}
 
 	return better_found;
@@ -260,6 +715,67 @@ static int t5838_configure(const struct device *dev, struct dmic_cfg *config)
 	uint32_t def_map, alt_map;
 	nrfx_pdm_config_t nrfx_cfg;
 	nrfx_err_t err;
+
+/* T5838 specific configuration */
+#if T5838_ANY_INST_HAS_WAKE
+	err = gpio_pin_configure_dt(drv_cfg->wake, GPIO_INPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_THSEL
+	err = gpio_pin_configure_dt(drv_cfg->thsel, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_PDMCLK
+	err = gpio_pin_configure_dt(drv_cfg->pdmclk, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_MICEN
+	/* set micen low to turn of microphone and make sure we start in reset state*/
+	err = gpio_pin_configure_dt(drv_cfg->micen, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+	err = gpio_pin_set_dt(drv_cfg->micen, 0);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+	}
+#if T5838_ANY_INST_AAD_CAPABLE
+	drv_data->aad_enabled = 0;
+#endif /**T5838_ANY_INST_AAD_CAPABLE */
+	/* Wait for device to power down and reapply power to reset it */
+	k_sleep(K_MSEC(T5838_RESET_TIME_MS));
+	err = gpio_pin_set_dt(drv_cfg->micen, 1);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif /*T5838_ANY_INST_HAS_MICEN*/
 
 	if (drv_data->active) {
 		LOG_ERR("Cannot configure device while it is active");
@@ -496,53 +1012,87 @@ static void init_clock_manager(const struct device *dev)
 	__ASSERT_NO_MSG(drv_data->clk_mgr != NULL);
 }
 
-static const struct _dmic_ops dmic_ops = {
+static const struct _dmic_ops t5838_dmic_ops = {
 	.configure = t5838_configure,
 	.trigger = t5838_trigger,
 	.read = t5838_pdm_read,
 };
 
-#define PDM(idx)	 DT_NODELABEL(pdm##idx)
-#define PDM_CLK_SRC(idx) DT_STRING_TOKEN(PDM(idx), clock_source)
+#define T5838_NODE_ID(idx)     DT_NODELABEL(t5838)
+#define T5838_PDM(idx)	       DT_NODELABEL(pdm##idx)
+#define T5838_PDM_CLK_SRC(idx) DT_STRING_TOKEN(T5838_PDM(idx), clock_source)
 
-#define PDM_NRFX_DEVICE(idx)                                                                       \
-	static void *rx_msgs##idx[DT_PROP(PDM(idx), queue_size)];                                  \
+#define T5838_HAS_THSEL_GPIO(idx) DT_NODE_HAS_PROP(DT_DRV_INST(idx), thsel_gpios)
+#define T5838_THSEL_GPIO_SPEC(idx)                                                                 \
+	IF_ENABLED(T5838_HAS_THSEL_GPIO(idx),                                                      \
+		   (static const struct gpio_dt_spec thsel_##idx =                                 \
+			    GPIO_DT_SPEC_GET(DT_DRV_INST(idx), thsel_gpios);))
+
+#define T5838_HAS_MICEN_GPIO(idx) DT_NODE_HAS_PROP(DT_DRV_INST(idx), micen_gpios)
+#define T5838_MICEN_GPIO_SPEC(idx)                                                                 \
+	IF_ENABLED(T5838_HAS_MICEN_GPIO(idx),                                                      \
+		   (static const struct gpio_dt_spec micen_##idx =                                 \
+			    GPIO_DT_SPEC_GET(DT_DRV_INST(idx), micen_gpios);))
+
+#define T5838_HAS_WAKE_GPIO(idx) DT_NODE_HAS_PROP(DT_DRV_INST(idx), wake_gpios)
+#define T5838_WAKE_GPIO_SPEC(idx)                                                                  \
+	IF_ENABLED(T5838_HAS_WAKE_GPIO(idx),                                                       \
+		   (static const struct gpio_dt_spec wake_##idx =                                  \
+			    GPIO_DT_SPEC_GET(DT_DRV_INST(idx), wake_gpios);))
+
+#define T5838_HAS_PDMCLK_GPIO(idx) DT_NODE_HAS_PROP(DT_DRV_INST(idx), pdmclk_gpios)
+#define T5838_PDMCLK_GPIO_SPEC(idx)                                                                \
+	IF_ENABLED(T5838_HAS_PDMCLK_GPIO(idx),                                                     \
+		   (static const struct gpio_dt_spec pdmclk_##idx =                                \
+			    GPIO_DT_SPEC_GET(DT_DRV_INST(idx), pdmclk_gpios);))
+
+#define T5838_PDM_NRFX_DEVICE(idx)                                                                 \
+	static void *t5838_rx_msgs##idx[DT_PROP(T5838_PDM(idx), queue_size)];                      \
 	static struct t5838_drv_data t5838_data##idx;                                              \
-	static int pdm_nrfx_init##idx(const struct device *dev)                                    \
+	T5838_THSEL_GPIO_SPEC(idx)                                                                 \
+	T5838_MICEN_GPIO_SPEC(idx)                                                                 \
+	T5838_WAKE_GPIO_SPEC(idx)                                                                  \
+	T5838_PDMCLK_GPIO_SPEC(idx)                                                                \
+	static int t5838_pdm_nrfx_init##idx(const struct device *dev)                              \
 	{                                                                                          \
-		IRQ_CONNECT(DT_IRQN(PDM(idx)), DT_IRQ(PDM(idx), priority), nrfx_isr,               \
+		IRQ_CONNECT(DT_IRQN(T5838_PDM(idx)), DT_IRQ(T5838_PDM(idx), priority), nrfx_isr,   \
 			    nrfx_pdm_irq_handler, 0);                                              \
 		const struct t5838_drv_cfg *drv_cfg = dev->config;                                 \
 		int err = pinctrl_apply_state(drv_cfg->pcfg, PINCTRL_STATE_DEFAULT);               \
 		if (err < 0) {                                                                     \
 			return err;                                                                \
 		}                                                                                  \
-		k_msgq_init(&t5838_data##idx.rx_queue, (char *)rx_msgs##idx, sizeof(void *),       \
-			    ARRAY_SIZE(rx_msgs##idx));                                             \
+		k_msgq_init(&t5838_data##idx.rx_queue, (char *)t5838_rx_msgs##idx, sizeof(void *), \
+			    ARRAY_SIZE(t5838_rx_msgs##idx));                                       \
 		init_clock_manager(dev);                                                           \
 		return 0;                                                                          \
 	}                                                                                          \
 	static void event_handler##idx(const nrfx_pdm_evt_t *evt)                                  \
 	{                                                                                          \
-		event_handler(DEVICE_DT_GET(PDM(idx)), evt);                                       \
+		event_handler(DEVICE_DT_GET(T5838_NODE_ID(idx)), evt);                             \
 	}                                                                                          \
-	PINCTRL_DT_DEFINE(PDM(idx));                                                               \
+	PINCTRL_DT_DEFINE(T5838_PDM(idx));                                                         \
 	static const struct t5838_drv_cfg t5838_cfg##idx = {                                       \
 		.event_handler = event_handler##idx,                                               \
 		.nrfx_def_cfg = NRFX_PDM_DEFAULT_CONFIG(0, 0),                                     \
 		.nrfx_def_cfg.skip_gpio_cfg = true,                                                \
 		.nrfx_def_cfg.skip_psel_cfg = true,                                                \
-		.pcfg = PINCTRL_DT_DEV_CONFIG_GET(PDM(idx)),                                       \
-		.clk_src = PDM_CLK_SRC(idx),                                                       \
-	};                                                                                         \
-	BUILD_ASSERT(PDM_CLK_SRC(idx) != ACLK || NRF_PDM_HAS_MCLKCONFIG,                           \
+		.pcfg = PINCTRL_DT_DEV_CONFIG_GET(T5838_PDM(idx)),                                 \
+		.clk_src = T5838_PDM_CLK_SRC(idx),                                                 \
+		IF_ENABLED(T5838_HAS_MICEN_GPIO(idx), (.micen = &micen_##idx, ))                   \
+			IF_ENABLED(T5838_HAS_THSEL_GPIO(idx), (.thsel = &thsel_##idx, ))           \
+				IF_ENABLED(T5838_HAS_WAKE_GPIO(idx), (.wake = &wake_##idx, ))      \
+					IF_ENABLED(T5838_HAS_PDMCLK_GPIO(idx),                     \
+						   (.pdmclk = &pdmclk_##idx, ))};                  \
+	BUILD_ASSERT(T5838_PDM_CLK_SRC(idx) != ACLK || NRF_PDM_HAS_MCLKCONFIG,                     \
 		     "Clock source ACLK is not available.");                                       \
-	BUILD_ASSERT(PDM_CLK_SRC(idx) != ACLK ||                                                   \
+	BUILD_ASSERT(T5838_PDM_CLK_SRC(idx) != ACLK ||                                             \
 			     DT_NODE_HAS_PROP(DT_NODELABEL(clock), hfclkaudio_frequency),          \
 		     "Clock source ACLK requires the hfclkaudio-frequency "                        \
 		     "property to be defined in the nordic,nrf-clock node.");                      \
-	DEVICE_DT_DEFINE(PDM(idx), pdm_nrfx_init##idx, NULL, &t5838_data##idx, &t5838_cfg##idx,    \
-			 POST_KERNEL, CONFIG_AUDIO_DMIC_INIT_PRIORITY, &dmic_ops);
+	DEVICE_DT_DEFINE(T5838_NODE_ID(idx), t5838_pdm_nrfx_init##idx, NULL, &t5838_data##idx,     \
+			 &t5838_cfg##idx, POST_KERNEL, CONFIG_T5838_INIT_PRIORITY,                 \
+			 &t5838_dmic_ops);
 
-/* Existing SoCs only have one PDM instance. */
-PDM_NRFX_DEVICE(0);
+/* Existing SoCs only have one PDM instance - that is why we support only one instance of mic */
+T5838_PDM_NRFX_DEVICE(0);
