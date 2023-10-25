@@ -57,8 +57,8 @@ struct t5838_drv_data {
 
 /* T5838 specific data */
 #if T5838_ANY_INST_AAD_CAPABLE
-	struct t5838_thconf thconf;
-	bool aad_enabled;
+	bool aad_unlocked;
+	enum t5838_aad_select aad_enabled_mode;
 
 	struct gpio_callback wake_cb;
 	bool cb_configured;
@@ -285,6 +285,112 @@ int prv_t5838_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
 }
 
 /**
+ * @brief Function helper for initialization of device GPIOs.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ *
+ * @retval 0 If successful.
+ */
+int prv_t5838_configure_gpios(const struct device *dev)
+{
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	int err;
+	/* T5838 specific configuration */
+#if T5838_ANY_INST_HAS_WAKE
+	err = gpio_pin_configure_dt(drv_cfg->wake, GPIO_INPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_THSEL
+	err = gpio_pin_configure_dt(drv_cfg->thsel, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_PDMCLK
+	err = gpio_pin_configure_dt(drv_cfg->pdmclk, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif
+
+#if T5838_ANY_INST_HAS_MICEN
+	/* set micen low to turn of microphone and make sure we start in reset state*/
+	err = gpio_pin_configure_dt(drv_cfg->micen, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+	err = gpio_pin_set_dt(drv_cfg->micen, 1);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+	}
+#endif /*T5838_ANY_INST_HAS_MICEN*/
+	return 0;
+}
+
+/**
+ * @brief Function helper for sending predefined sequence that unlocks aad mode.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ *
+ * @retval 0 If successful.
+ */
+int prv_t5838_aad_unlock_sequence(const struct device *dev)
+{
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+
+	if (drv_data->aad_unlocked == false) {
+		/** This is unlock sequence for AAD modes provided in datasheet. */
+		err = prv_t5838_reg_write(dev, 0x5C, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x3E, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x6F, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x3B, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		err = prv_t5838_reg_write(dev, 0x4C, 0x00);
+		if (err < 0) {
+			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			return err;
+		}
+		drv_data->aad_unlocked = true;
+	}
+	return 0;
+}
+
+/**
  * @brief Function for putting T5838 into sleep mode with AAD is enabled. Must be called after
  * writing to AAD registers.
  *
@@ -347,6 +453,46 @@ static void prv_wake_cb_handler(const struct device *dev, struct gpio_callback *
 }
 #endif
 
+int t5838_reset(const struct device *dev)
+{
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+#if T5838_ANY_INST_HAS_MICEN
+	/* set micen low to turn of microphone and make sure we start in reset state*/
+	err = gpio_pin_configure_dt(drv_cfg->micen, GPIO_OUTPUT);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
+			return err;
+		}
+	}
+	err = gpio_pin_set_dt(drv_cfg->micen, 0);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+	}
+#if T5838_ANY_INST_AAD_CAPABLE
+	drv_data->aad_unlocked = false;
+	drv_data->aad_enabled_mode = T5838_AAD_SELECT_NONE;
+#endif /**T5838_ANY_INST_AAD_CAPABLE */
+	/* Wait for device to power down and reapply power to reset it */
+	k_sleep(K_MSEC(T5838_RESET_TIME_MS));
+	err = gpio_pin_set_dt(drv_cfg->micen, 1);
+	if (err < 0) {
+		if (err < 0) {
+			LOG_ERR("gpio_pin_set_dt, err: %d", err);
+			return err;
+		}
+	}
+	return 0;
+#else /*T5838_ANY_INST_HAS_MICEN*/
+	return -ENOTSUP;
+#endif
+}
+
 int t5838_wake_clear(const struct device *dev)
 {
 	const struct t5838_drv_cfg *drv_cfg = dev->config;
@@ -369,7 +515,7 @@ void t5838_wake_handler_set(const struct device *dev, t5838_wake_handler_t handl
 	drv_data->wake_handler = handler;
 }
 
-int t5838_AAD_configure(const struct device *dev, struct t5838_thconf *thconf)
+int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadconf)
 {
 #if !T5838_ANY_INST_AAD_CAPABLE
 	return -ENOTSUP;
@@ -383,142 +529,51 @@ int t5838_AAD_configure(const struct device *dev, struct t5838_thconf *thconf)
 		return -EBUSY;
 	}
 
-	/** if AAD mode is selected, first write unlock sequence */
-	if (thconf->aad_select != T5838_AAD_SELECT_NONE && drv_data->aad_enabled == false) {
-		/** This is unlock sequence for AAD modes provided in datasheet. */
-		err = prv_t5838_reg_write(dev, 0x5C, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x3E, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x6F, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x3B, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x4C, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		drv_data->aad_enabled = true;
+	err = prv_t5838_configure_gpios(dev);
+	if (err < 0) {
+		LOG_ERR("gpio configuration error, err: %d", err);
+		return err;
 	}
+
+	/** if AAD mode is selected, first write unlock sequence */
+	err = prv_t5838_aad_unlock_sequence(dev);
+	if (err < 0) {
+		LOG_ERR("error writing aad unlock sequence, err: %d", err);
+		return err;
+	}
+
 	/** Set AAD mode to zero while we configure device to avoid problems */
 	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
 	if (err < 0) {
 		LOG_ERR("prv_t5838_reg_write, err: %d", err);
 		return err;
 	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_LPF, aadconf->aad_a_lpf);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_THR, aadconf->aad_a_thr);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_A);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	drv_data->aad_enabled_mode = T5838_AAD_SELECT_A;
 
-	switch (thconf->aad_select) {
-	case T5838_AAD_SELECT_A:
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_LPF, thconf->aad_a_lpf);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_THR, thconf->aad_a_thr);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, thconf->aad_select);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_enter_sleep_with_AAD(dev);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		break;
-	case T5838_AAD_SELECT_D1:
-	case T5838_AAD_SELECT_D2:
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO,
-					  thconf->aad_d_abs_thr & 0xFF);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
-					  (thconf->aad_d_abs_thr >> 8) & 0x1F);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO,
-					  thconf->aad_d_floor & 0xFF);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
-					  (thconf->aad_d_floor >> 8) & 0x1F);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
-					  thconf->aad_d_rel_pulse_min & 0xFF);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
-					  ((thconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
-						  (thconf->aad_d_rel_pulse_min & 0x0F));
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
-					  thconf->aad_d_abs_pulse_min & 0xFF);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, thconf->aad_d_rel_thr);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-
-		err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, thconf->aad_select);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_enter_sleep_with_AAD(dev);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		break;
-	case T5838_AAD_SELECT_NONE:
-		return 0;
-		break;
-	default:
-		/* This means invalid AAD mode value was selected */
-		return -EINVAL;
-		break;
+	err = prv_t5838_enter_sleep_with_AAD(dev);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
 	}
 
-	/* configure interrupt */
-	if (thconf->aad_select != T5838_AAD_SELECT_NONE) {
+	/**Configure interrupts */
+
+	if (drv_data->cb_configured == false) {
 		drv_data->int_handled = false;
 		gpio_init_callback(&drv_data->wake_cb, prv_wake_cb_handler,
 				   BIT(drv_cfg->wake->pin));
@@ -528,14 +583,274 @@ int t5838_AAD_configure(const struct device *dev, struct t5838_thconf *thconf)
 			LOG_ERR("gpio_add_callback, err: %d", err);
 			return err;
 		}
-		err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+		drv_data->cb_configured = true;
+		g_drv_data = drv_data;
+		g_drv_cfg = drv_cfg;
+	}
+	err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+		return err;
+	}
+
+	return 0;
+#endif
+}
+
+int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+	/** Make sure there is no PDM transfer in progress, and we can take clock signal */
+	if (drv_data->active) {
+		LOG_ERR("Cannot write to device while pdm is active");
+		return -EBUSY;
+	}
+
+	err = prv_t5838_configure_gpios(dev);
+	if (err < 0) {
+		LOG_ERR("gpio configuration error, err: %d", err);
+		return err;
+	}
+
+	/** if AAD mode is selected, first write unlock sequence */
+	err = prv_t5838_aad_unlock_sequence(dev);
+	if (err < 0) {
+		LOG_ERR("error writing aad unlock sequence, err: %d", err);
+		return err;
+	}
+	/** Set AAD mode to zero while we configure device to avoid problems */
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO, aadconf->aad_d_abs_thr & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
+				  (aadconf->aad_d_abs_thr >> 8) & 0x1F);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO, aadconf->aad_d_floor & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
+				  (aadconf->aad_d_floor >> 8) & 0x1F);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
+				  aadconf->aad_d_rel_pulse_min & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
+				  ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
+					  (aadconf->aad_d_rel_pulse_min & 0x0F));
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
+				  aadconf->aad_d_abs_pulse_min & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, aadconf->aad_d_rel_thr);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_D1);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_enter_sleep_with_AAD(dev);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	/**Configure interrupts */
+
+	if (drv_data->cb_configured == false) {
+		drv_data->int_handled = false;
+		gpio_init_callback(&drv_data->wake_cb, prv_wake_cb_handler,
+				   BIT(drv_cfg->wake->pin));
+
+		err = gpio_add_callback(drv_cfg->wake->port, &drv_data->wake_cb);
 		if (err) {
-			LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+			LOG_ERR("gpio_add_callback, err: %d", err);
 			return err;
 		}
 		drv_data->cb_configured = true;
 		g_drv_data = drv_data;
 		g_drv_cfg = drv_cfg;
+	}
+	err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+		return err;
+	}
+	return 0;
+#endif
+}
+
+int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	struct t5838_drv_data *drv_data = dev->data;
+	int err;
+	/** Make sure there is no PDM transfer in progress, and we can take clock signal */
+	if (drv_data->active) {
+		LOG_ERR("Cannot write to device while pdm is active");
+		return -EBUSY;
+	}
+
+	err = prv_t5838_configure_gpios(dev);
+	if (err < 0) {
+		LOG_ERR("gpio configuration error, err: %d", err);
+		return err;
+	}
+
+	/** if AAD mode is selected, first write unlock sequence */
+	err = prv_t5838_aad_unlock_sequence(dev);
+	if (err < 0) {
+		LOG_ERR("error writing aad unlock sequence, err: %d", err);
+		return err;
+	}
+	/** Set AAD mode to zero while we configure device to avoid problems */
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO, aadconf->aad_d_abs_thr & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
+				  (aadconf->aad_d_abs_thr >> 8) & 0x1F);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO, aadconf->aad_d_floor & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
+				  (aadconf->aad_d_floor >> 8) & 0x1F);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
+				  aadconf->aad_d_rel_pulse_min & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
+				  ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
+					  (aadconf->aad_d_rel_pulse_min & 0x0F));
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
+				  aadconf->aad_d_abs_pulse_min & 0xFF);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, aadconf->aad_d_rel_thr);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_D2);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	err = prv_t5838_enter_sleep_with_AAD(dev);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	/**Configure interrupts */
+
+	if (drv_data->cb_configured == false) {
+		drv_data->int_handled = false;
+		gpio_init_callback(&drv_data->wake_cb, prv_wake_cb_handler,
+				   BIT(drv_cfg->wake->pin));
+
+		err = gpio_add_callback(drv_cfg->wake->port, &drv_data->wake_cb);
+		if (err) {
+			LOG_ERR("gpio_add_callback, err: %d", err);
+			return err;
+		}
+		drv_data->cb_configured = true;
+		g_drv_data = drv_data;
+		g_drv_cfg = drv_cfg;
+	}
+	err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+		return err;
+	}
+	return 0;
+#endif
+}
+
+int t5838_aad_mode_disable(const struct device *dev)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	const struct t5838_drv_cfg *drv_cfg = dev->config;
+	int err;
+	/** Set AAD mode to zero while we configure device to avoid problems */
+	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+	if (err < 0) {
+		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		return err;
+	}
+	/** Disable interrupts */
+	err = gpio_pin_interrupt_configure_dt(drv_cfg->wake, GPIO_INT_DISABLE);
+	if (err) {
+		LOG_ERR("gpio_pin_interrupt_configure_dt, err: %d", err);
+		return err;
 	}
 	return 0;
 #endif
@@ -716,66 +1031,7 @@ static int t5838_configure(const struct device *dev, struct dmic_cfg *config)
 	nrfx_pdm_config_t nrfx_cfg;
 	nrfx_err_t err;
 
-/* T5838 specific configuration */
-#if T5838_ANY_INST_HAS_WAKE
-	err = gpio_pin_configure_dt(drv_cfg->wake, GPIO_INPUT);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
-			return err;
-		}
-	}
-#endif
-
-#if T5838_ANY_INST_HAS_THSEL
-	err = gpio_pin_configure_dt(drv_cfg->thsel, GPIO_OUTPUT);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
-			return err;
-		}
-	}
-#endif
-
-#if T5838_ANY_INST_HAS_PDMCLK
-	err = gpio_pin_configure_dt(drv_cfg->pdmclk, GPIO_OUTPUT);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
-			return err;
-		}
-	}
-#endif
-
-#if T5838_ANY_INST_HAS_MICEN
-	/* set micen low to turn of microphone and make sure we start in reset state*/
-	err = gpio_pin_configure_dt(drv_cfg->micen, GPIO_OUTPUT);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_configure_dt, err: %d", err);
-			return err;
-		}
-	}
-	err = gpio_pin_set_dt(drv_cfg->micen, 0);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_set_dt, err: %d", err);
-			return err;
-		}
-	}
-#if T5838_ANY_INST_AAD_CAPABLE
-	drv_data->aad_enabled = 0;
-#endif /**T5838_ANY_INST_AAD_CAPABLE */
-	/* Wait for device to power down and reapply power to reset it */
-	k_sleep(K_MSEC(T5838_RESET_TIME_MS));
-	err = gpio_pin_set_dt(drv_cfg->micen, 1);
-	if (err < 0) {
-		if (err < 0) {
-			LOG_ERR("gpio_pin_set_dt, err: %d", err);
-			return err;
-		}
-	}
-#endif /*T5838_ANY_INST_HAS_MICEN*/
+	prv_t5838_configure_gpios(dev);
 
 	if (drv_data->active) {
 		LOG_ERR("Cannot configure device while it is active");
@@ -945,6 +1201,9 @@ static int t5838_trigger(const struct device *dev, enum dmic_trigger cmd)
 		if (drv_data->active) {
 			drv_data->stopping = true;
 			nrfx_pdm_stop();
+		}
+		if (drv_data->aad_enabled_mode != T5838_AAD_SELECT_NONE) {
+			prv_t5838_enter_sleep_with_AAD(dev);
 		}
 		break;
 

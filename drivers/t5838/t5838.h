@@ -190,37 +190,27 @@ enum t5838_aad_d_abs_pulse_min {
 typedef void (*t5838_wake_handler_t)(const struct device *dev);
 
 /**
- * @brief AAD configuration structure
+ * @brief AAD A configuration structure
  *
- * This structure holds full configuration of AAD modes to be written to device.
+ * This structure holds full configuration of AAD A mode to be written to device.
  */
-struct t5838_thconf {
-	/* enum used in all AAD modes */
-	enum t5838_aad_select aad_select;
-
-	/* enums used in AAD A mode */
+struct t5838_aad_a_conf {
 	enum t5838_aad_a_lpf aad_a_lpf;
 	enum t5838_aad_a_thr aad_a_thr;
+};
 
-	/* enums used in AAD D modes */
+/**
+ * @brief AAD D configuration structure
+ *
+ * This structure holds full configuration of AAD D1 and D2 modes to be written to device.
+ */
+struct t5838_aad_d_conf {
 	enum t5838_aad_d_floor aad_d_floor;
 	enum t5838_aad_d_rel_pulse_min aad_d_rel_pulse_min;
 	enum t5838_aad_d_abs_pulse_min aad_d_abs_pulse_min;
 	enum t5838_aad_d_abs_thr aad_d_abs_thr;
 	enum t5838_aad_d_rel_thr aad_d_rel_thr;
 };
-
-/**
- * @brief Initialize T5838 device AAD mode
- *
- * Function will configure and run T5838 AAD and configure interrupts on wake pin.
- *
- * @param dev Pointer to the device structure for the driver instance.
- * @param thconf Pointer to the structure containing AAD configuration
- *
- * @return int 0 if successful, negative errno code if failure.
- */
-int t5838_AAD_configure(const struct device *dev, struct t5838_thconf *thconf);
 
 /**
  * @brief Set AAD wake pin interrupt handler function
@@ -244,6 +234,62 @@ void t5838_wake_handler_set(const struct device *dev, t5838_wake_handler_t handl
  * @return int 0 if successful, negative errno code if failure.
  */
 int t5838_wake_clear(const struct device *dev);
+
+/**
+ * @brief Configure T5838 device into AAD A mode
+ *
+ * Function will configure and run T5838 AAD and configure interrupts on wake pin.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param aadconf Pointer to the structure containing AAD A configuration
+ *
+ * @return int 0 if successful, negative errno code if failure.
+ */
+int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadconf);
+
+/**
+ * @brief Configure T5838 device into AAD D1 mode
+ *
+ * Function will configure and run T5838 AAD and configure interrupts on wake pin.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param aadconf Pointer to the structure containing AAD D configuration
+ *
+ * @return int 0 if successful, negative errno code if failure.
+ */
+int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf);
+
+/**
+ * @brief Configure T5838 device into AAD D2 mode
+ *
+ * Function will configure and run T5838 AAD and configure interrupts on wake pin.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param aadconf Pointer to the structure containing AAD D configuration
+ *
+ * @return int 0 if successful, negative errno code if failure.
+ */
+int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf);
+
+/**
+ * @brief Disable AAD functionality
+ *
+ * Function will disable AAD functionality and disable interrupts on wake pin.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ *
+ * @return int 0 if successful, negative errno code if failure.
+ */
+int t5838_aad_mode_disable(const struct device *dev);
+
+/**
+ * @brief Reset T5838 device using mic enable pin GPIO
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ *
+ * @return int 0 if successful, negative errno code if failure.
+ */
+int t5838_reset(const struct device *dev);
 
 #ifdef __cplusplus
 }
