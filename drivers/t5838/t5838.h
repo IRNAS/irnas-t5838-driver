@@ -16,25 +16,6 @@ extern "C" {
 #include <stdint.h>
 #include <zephyr/device.h>
 
-/* Although datasheet mentions that t5838 uses One Wire Protocol for configuration of AAD
- * functionality, it is really using two wires (THSEL and PDMCLK) for this, similar to the I2C
- * protocol. That's why FAKE2C names was used to describe this protocol. */
-#define T5838_FAKE2C_START_PILOT_CLKS 10
-#define T5838_FAKE2C_ZERO	      1 * T5838_FAKE2C_START_PILOT_CLKS
-#define T5838_FAKE2C_ONE	      3 * T5838_FAKE2C_START_PILOT_CLKS
-#define T5838_FAKE2C_STOP	      130 /* according to datasheet >128clk cycles */
-#define T5838_FAKE2C_SPACE	      1 * T5838_FAKE2C_START_PILOT_CLKS
-
-#define T5838_FAKE2C_POST_WRITE_CYCLES 60 /* According to datasheet >50clk cycles */
-#define T5838_FAKE2C_PRE_WRITE_CYCLES  60 /* According to datasheet >50clk cycles */
-#define T5838_FAKE2C_DEVICE_ADDRESS    0x53
-
-#define T5838_FAKE2C_CLK_PERIOD_US 10 /* approx 100kHz */
-
-/* >2ms of clock is required before entering sleep with AAD  */
-#define T5838_ENTER_SLEEP_MODE_CLOCKING_TIME_uS 2500
-#define T5838_ENTER_SLEEP_MODE_CLK_PERIOD_uS	10 /* approx 100kHz */
-
 #define T5838_REG_AAD_MODE			 0x29
 #define T5838_REG_AAD_D_FLOOR_HI		 0x2A
 #define T5838_REG_AAD_D_FLOOR_LO		 0x2B
@@ -46,8 +27,6 @@ extern "C" {
 #define T5838_REG_AAD_D_REL_THR			 0x33
 #define T5838_REG_AAD_A_LPF			 0x35
 #define T5838_REG_AAD_A_THR			 0x36
-
-#define T5838_RESET_TIME_MS 10 /* Time required for device to reset when power is disabled*/
 
 /**
  * @brief AAD modes

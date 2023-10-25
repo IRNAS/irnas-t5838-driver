@@ -44,6 +44,32 @@ const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 #define T5838_ANY_INST_AAD_CAPABLE                                                                 \
 	T5838_ANY_INST_HAS_THSEL &&T5838_ANY_INST_HAS_WAKE &&T5838_ANY_INST_HAS_PDMCLK
 
+/* Although datasheet mentions that t5838 uses One Wire Protocol for configuration of AAD
+ * functionality, it is really using two wires (THSEL and PDMCLK) for this, similar to the I2C
+ * protocol. That's why FAKE2C names was used to describe this protocol. */
+#define T5838_FAKE2C_START_PILOT_CLKS 10
+#define T5838_FAKE2C_ZERO	      1 * T5838_FAKE2C_START_PILOT_CLKS
+#define T5838_FAKE2C_ONE	      3 * T5838_FAKE2C_START_PILOT_CLKS
+#define T5838_FAKE2C_STOP	      130 /* according to datasheet >128clk cycles */
+#define T5838_FAKE2C_SPACE	      1 * T5838_FAKE2C_START_PILOT_CLKS
+
+#define T5838_FAKE2C_POST_WRITE_CYCLES 60 /* According to datasheet >50clk cycles */
+#define T5838_FAKE2C_PRE_WRITE_CYCLES  60 /* According to datasheet >50clk cycles */
+#define T5838_FAKE2C_DEVICE_ADDRESS    0x53
+
+#define T5838_FAKE2C_CLK_PERIOD_US 10 /* approx 100kHz */
+
+/* >2ms of clock is required before entering sleep with AAD  */
+#define T5838_ENTER_SLEEP_MODE_CLOCKING_TIME_uS 2500
+#define T5838_ENTER_SLEEP_MODE_CLK_PERIOD_uS	10 /* approx 100kHz */
+
+#define T5838_RESET_TIME_MS 10 /* Time required for device to reset when power is disabled*/
+
+struct t5838_address_data_pair {
+	uint8_t address;
+	uint8_t data;
+};
+
 struct t5838_drv_data {
 	struct onoff_manager *clk_mgr;
 	struct onoff_client clk_cli;
@@ -284,6 +310,25 @@ int prv_t5838_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
 #endif
 }
 
+int prv_t5838_multi_reg_write(const struct device *dev, struct t5838_address_data_pair *data,
+			      uint8_t num)
+{
+#if !T5838_ANY_INST_AAD_CAPABLE
+	return -ENOTSUP;
+#else
+	int err;
+	for (int i = 0; i < num; i++) {
+		err = prv_t5838_reg_write(dev, data[i].address, data[i].data);
+		if (err < 0) {
+			LOG_ERR("t5838 reg write err: %d, addr: %x, data: %x", err, data[i].address,
+				data[i].data);
+			return err;
+		}
+	}
+	return 0;
+#endif
+}
+
 /**
  * @brief Function helper for initialization of device GPIOs.
  *
@@ -360,29 +405,16 @@ int prv_t5838_aad_unlock_sequence(const struct device *dev)
 
 	if (drv_data->aad_unlocked == false) {
 		/** This is unlock sequence for AAD modes provided in datasheet. */
-		err = prv_t5838_reg_write(dev, 0x5C, 0x00);
+		struct t5838_address_data_pair write_data[] = {
+			{.address = 0x5C, .data = 0x00}, {.address = 0x3E, .data = 0x00},
+			{.address = 0x6F, .data = 0x00}, {.address = 0x3B, .data = 0x00},
+			{.address = 0x4C, .data = 0x00},
+		};
+
+		err = prv_t5838_multi_reg_write(dev, write_data,
+						sizeof(write_data) / sizeof(write_data[0]));
 		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x3E, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x6F, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x3B, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
-			return err;
-		}
-		err = prv_t5838_reg_write(dev, 0x4C, 0x00);
-		if (err < 0) {
-			LOG_ERR("prv_t5838_reg_write, err: %d", err);
+			LOG_ERR("prv_t5838_multi_reg_write, err: %d", err);
 			return err;
 		}
 		drv_data->aad_unlocked = true;
@@ -455,10 +487,10 @@ static void prv_wake_cb_handler(const struct device *dev, struct gpio_callback *
 
 int t5838_reset(const struct device *dev)
 {
+#if T5838_ANY_INST_HAS_MICEN
 	const struct t5838_drv_cfg *drv_cfg = dev->config;
 	struct t5838_drv_data *drv_data = dev->data;
 	int err;
-#if T5838_ANY_INST_HAS_MICEN
 	/* set micen low to turn of microphone and make sure we start in reset state*/
 	err = gpio_pin_configure_dt(drv_cfg->micen, GPIO_OUTPUT);
 	if (err < 0) {
@@ -542,27 +574,20 @@ int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadc
 		return err;
 	}
 
-	/** Set AAD mode to zero while we configure device to avoid problems */
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+	struct t5838_address_data_pair write_data[] = {
+		{.address = T5838_REG_AAD_MODE, .data = 0x00},
+		{.address = T5838_REG_AAD_A_LPF, .data = aadconf->aad_a_lpf},
+		{.address = T5838_REG_AAD_A_THR, .data = aadconf->aad_a_thr},
+		{.address = T5838_REG_AAD_MODE, .data = T5838_AAD_SELECT_A},
+	};
+
+	err = prv_t5838_multi_reg_write(dev, write_data,
+					sizeof(write_data) / sizeof(write_data[0]));
 	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		LOG_ERR("prv_t5838_multi_reg_write, err: %d", err);
 		return err;
 	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_LPF, aadconf->aad_a_lpf);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_A_THR, aadconf->aad_a_thr);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_A);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
+
 	drv_data->aad_enabled_mode = T5838_AAD_SELECT_A;
 
 	err = prv_t5838_enter_sleep_with_AAD(dev);
@@ -623,68 +648,32 @@ int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
 		LOG_ERR("error writing aad unlock sequence, err: %d", err);
 		return err;
 	}
-	/** Set AAD mode to zero while we configure device to avoid problems */
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+
+	struct t5838_address_data_pair write_data[] = {
+		{.address = T5838_REG_AAD_MODE, .data = 0x00},
+		{.address = T5838_REG_AAD_D_ABS_THR_LO, .data = aadconf->aad_d_abs_thr & 0xFF},
+		{.address = T5838_REG_AAD_D_ABS_THR_HI,
+		 .data = (aadconf->aad_d_abs_thr >> 8) & 0x1F},
+		{.address = T5838_REG_AAD_D_FLOOR_LO, .data = aadconf->aad_d_floor & 0xFF},
+		{.address = T5838_REG_AAD_D_FLOOR_HI, .data = (aadconf->aad_d_floor >> 8) & 0x1F},
+		{.address = T5838_REG_AAD_D_REL_PULSE_MIN_LO,
+		 .data = aadconf->aad_d_rel_pulse_min & 0xFF},
+		{.address = T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
+		 .data = ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
+			 (aadconf->aad_d_rel_pulse_min & 0x0F)},
+		{.address = T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
+		 .data = T5838_REG_AAD_D_ABS_PULSE_MIN_LO},
+		{.address = T5838_REG_AAD_D_REL_THR, .data = aadconf->aad_d_rel_thr},
+		{.address = T5838_REG_AAD_MODE, .data = T5838_AAD_SELECT_D1},
+	};
+
+	err = prv_t5838_multi_reg_write(dev, write_data,
+					sizeof(write_data) / sizeof(write_data[0]));
 	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		LOG_ERR("prv_t5838_multi_reg_write, err: %d", err);
 		return err;
 	}
 
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO, aadconf->aad_d_abs_thr & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
-				  (aadconf->aad_d_abs_thr >> 8) & 0x1F);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO, aadconf->aad_d_floor & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
-				  (aadconf->aad_d_floor >> 8) & 0x1F);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
-				  aadconf->aad_d_rel_pulse_min & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
-				  ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
-					  (aadconf->aad_d_rel_pulse_min & 0x0F));
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
-				  aadconf->aad_d_abs_pulse_min & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, aadconf->aad_d_rel_thr);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_D1);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
 	err = prv_t5838_enter_sleep_with_AAD(dev);
 	if (err < 0) {
 		LOG_ERR("prv_t5838_reg_write, err: %d", err);
@@ -741,68 +730,32 @@ int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
 		LOG_ERR("error writing aad unlock sequence, err: %d", err);
 		return err;
 	}
-	/** Set AAD mode to zero while we configure device to avoid problems */
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, 0);
+
+	struct t5838_address_data_pair write_data[] = {
+		{.address = T5838_REG_AAD_MODE, .data = 0x00},
+		{.address = T5838_REG_AAD_D_ABS_THR_LO, .data = aadconf->aad_d_abs_thr & 0xFF},
+		{.address = T5838_REG_AAD_D_ABS_THR_HI,
+		 .data = (aadconf->aad_d_abs_thr >> 8) & 0x1F},
+		{.address = T5838_REG_AAD_D_FLOOR_LO, .data = aadconf->aad_d_floor & 0xFF},
+		{.address = T5838_REG_AAD_D_FLOOR_HI, .data = (aadconf->aad_d_floor >> 8) & 0x1F},
+		{.address = T5838_REG_AAD_D_REL_PULSE_MIN_LO,
+		 .data = aadconf->aad_d_rel_pulse_min & 0xFF},
+		{.address = T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
+		 .data = ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
+			 (aadconf->aad_d_rel_pulse_min & 0x0F)},
+		{.address = T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
+		 .data = T5838_REG_AAD_D_ABS_PULSE_MIN_LO},
+		{.address = T5838_REG_AAD_D_REL_THR, .data = aadconf->aad_d_rel_thr},
+		{.address = T5838_REG_AAD_MODE, .data = T5838_AAD_SELECT_D2},
+	};
+
+	err = prv_t5838_multi_reg_write(dev, write_data,
+					sizeof(write_data) / sizeof(write_data[0]));
 	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
+		LOG_ERR("prv_t5838_multi_reg_write, err: %d", err);
 		return err;
 	}
 
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_LO, aadconf->aad_d_abs_thr & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_THR_HI,
-				  (aadconf->aad_d_abs_thr >> 8) & 0x1F);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_LO, aadconf->aad_d_floor & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_FLOOR_HI,
-				  (aadconf->aad_d_floor >> 8) & 0x1F);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_PULSE_MIN_LO,
-				  aadconf->aad_d_rel_pulse_min & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,
-				  ((aadconf->aad_d_rel_pulse_min >> 4) / 0xF0) |
-					  (aadconf->aad_d_rel_pulse_min & 0x0F));
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_ABS_PULSE_MIN_LO,
-				  aadconf->aad_d_abs_pulse_min & 0xFF);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_D_REL_THR, aadconf->aad_d_rel_thr);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
-
-	err = prv_t5838_reg_write(dev, T5838_REG_AAD_MODE, T5838_AAD_SELECT_D2);
-	if (err < 0) {
-		LOG_ERR("prv_t5838_reg_write, err: %d", err);
-		return err;
-	}
 	err = prv_t5838_enter_sleep_with_AAD(dev);
 	if (err < 0) {
 		LOG_ERR("prv_t5838_reg_write, err: %d", err);
