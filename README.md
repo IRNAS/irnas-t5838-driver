@@ -37,7 +37,7 @@ T5838 datasheet for more information can be found [here](https://invensense.tdk.
       #size-cells = < 0x0 >;
       t5838: t5838@0 {
          status = "okay";
-         compatible = "tdk,t5838-nrf-pdm";
+         compatible = "invensense,t5838-nrf-pdm";
          micen-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
          thsel-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
          wake-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;

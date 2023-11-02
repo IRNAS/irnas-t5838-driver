@@ -14,7 +14,11 @@ extern "C" {
 #endif
 
 #include <stdint.h>
-#include <zephyr/device.h>
+
+#include <nrfx_pdm.h>
+
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/drivers/gpio.h>
 
 #define T5838_REG_AAD_MODE			 0x29
 #define T5838_REG_AAD_D_FLOOR_HI		 0x2A
@@ -59,8 +63,8 @@ enum t5838_aad_a_lpf {
  * @brief AAD A mode threshold
  *
  * This setting selects threshold for AAD A mode.
- * According to datasheet there are 8 possible values, but table in datasheet describes 9 values.
- * it seems to be 2,5dB step for LSB but only every other value exist in table
+ * @note According to datasheet there are 8 possible values, but table in datasheet describes 9
+ * values. it seems to be 2,5dB step for LSB but only every other value exist in table.
  */
 enum t5838_aad_a_thr {
 	T5838_AAD_A_THR_60dB = 0x00,
@@ -78,8 +82,8 @@ enum t5838_aad_a_thr {
  * @brief AAD D mode absolute threshold
  *
  * This setting selects absolute threshold for AAD D mode.
- * datasheet claim values between 0x00F and 0x7BC are allowed, but only provides us with table of
- * discrete values defined in this enumerator
+ * @note Datasheet claim values between 0x00F and 0x7BC are allowed, but only provides us with table
+ * of discrete values defined in this enumerator.
  */
 enum t5838_aad_d_abs_thr {
 	T5838_AAD_D_ABS_THR_40dB = 0x000F,
@@ -99,8 +103,8 @@ enum t5838_aad_d_abs_thr {
  * @brief AAD D mode relative threshold
  *
  * This setting selects relative threshold for AAD D mode.
- * datasheet claim values between 0x24 and 0xFF are allowed, but only provides us with table of
- * discrete values defined in this enumerator
+ * @note Datasheet claim values between 0x24 and 0xFF are allowed, but only provides us with table
+ * of discrete values defined in this enumerator.
  */
 enum t5838_aad_d_rel_thr {
 	T5838_AAD_D_REL_THR_3dB = 0x24,
@@ -116,8 +120,8 @@ enum t5838_aad_d_rel_thr {
  * @brief AAD D mode floor
  *
  * This setting selects relative threshold floor for AAD D mode.
- * datasheet claim values between 0x00F and 0x7BC are allowed, but only provides us with table of
- * discrete values defined in this enumerator
+ * @note Datasheet claim values between 0x00F and 0x7BC are allowed, but only provides us with table
+ * of discrete values defined in this enumerator.
  */
 enum t5838_aad_d_floor {
 	T5838_AAD_D_FLOOR_40dB = 0x000F,
@@ -137,8 +141,8 @@ enum t5838_aad_d_floor {
  * @brief AAD D mode relative pulse minimum
  *
  * This setting selects pulse minimum for AAD D mode relative threshold detection.
- * datasheet claim values between 0x000 and 0x12C are allowed, but only provides us with table of
- * discrete values defined in this enumerator
+ * @note Datasheet claim values between 0x000 and 0x12C are allowed, but only provides us with table
+ * of discrete values defined in this enumerator.
  */
 enum t5838_aad_d_rel_pulse_min {
 	T5838_AAD_D_REL_PULSE_MIN_0_7ms = 0x0000,
@@ -151,8 +155,8 @@ enum t5838_aad_d_rel_pulse_min {
  * @brief AAD D mode absolute pulse minimum
  *
  * This setting selects pulse minimum for AAD D mode absolute threshold detection.
- * datasheet claim values between 0x000 and 0x0DAC are allowed, but only provides us with table of
- * discrete values defined in this enumerator
+ * @note Datasheet claim values between 0x000 and 0x0DAC are allowed, but only provides us with
+ * table of discrete values defined in this enumerator.
  */
 enum t5838_aad_d_abs_pulse_min {
 	T5838_AAD_D_ABS_PULSE_MIN_1_1ms = 0x0000,
@@ -191,6 +195,59 @@ struct t5838_aad_d_conf {
 	enum t5838_aad_d_rel_thr aad_d_rel_thr;
 };
 
+struct t5838_drv_data {
+	struct onoff_manager *clk_mgr;
+	struct onoff_client clk_cli;
+	struct k_mem_slab *mem_slab;
+	uint32_t block_size;
+	struct k_msgq rx_queue;
+	bool request_clock : 1;
+	bool configured : 1;
+	volatile bool active;
+	volatile bool stopping;
+
+#ifdef CONFIG_T5838_AAD_TRIGGER
+	/* Pointer to child device for putting device back into low power after sampling */
+	const struct device *aad_child_dev;
+#endif /* CONFIG_T5838_AAD_TRIGGER */
+};
+
+struct t5838_drv_cfg {
+	nrfx_pdm_event_handler_t event_handler;
+	nrfx_pdm_config_t nrfx_def_cfg;
+	const struct pinctrl_dev_config *pcfg;
+	enum clock_source {
+		PCLK32M,
+		PCLK32M_HFXO,
+		ACLK
+	} clk_src;
+};
+
+#ifdef CONFIG_T5838_AAD_TRIGGER
+struct t5838_aad_drv_data {
+
+	bool aad_unlocked;
+	enum t5838_aad_select aad_enabled_mode;
+
+	struct gpio_callback wake_cb;
+	bool cb_configured;
+	bool int_handled;
+	t5838_wake_handler_t wake_handler;
+};
+
+struct t5838_aad_drv_cfg {
+	const struct device *pdm_dev;
+
+	const struct gpio_dt_spec micen;
+	bool micen_available;
+
+	const struct gpio_dt_spec wake;
+	const struct gpio_dt_spec thsel;
+	const struct gpio_dt_spec pdmclk;
+};
+#endif /* CONFIG_T5838_AAD_TRIGGER */
+
+#ifdef CONFIG_T5838_AAD_TRIGGER
 /**
  * @brief Set AAD wake pin interrupt handler function
  *
@@ -200,27 +257,27 @@ struct t5838_aad_d_conf {
  * @note when interrupt gets triggered it will disable further interrupts until
  * t5838_wake_clear() is called.
  *
- * @param dev Pointer to the device structure for the driver instance.
- * @param handler Pointer to the handler function to be called when interrupt is triggered.
+ * @param[in] dev Pointer to the device structure for the driver instance.
+ * @param[in] handler Pointer to the handler function to be called when interrupt is triggered.
  */
-void t5838_wake_handler_set(const struct device *dev, t5838_wake_handler_t handler);
+void t5838_aad_wake_handler_set(const struct device *dev, t5838_wake_handler_t handler);
 
 /**
  * @brief Clear AAD wake pin interrupt and re-enable AAD interrupts.
  *
- * @param dev Pointer to the device structure for the driver instance.
+ * @param[in] dev Pointer to the device structure for the driver instance.
  *
  * @return int 0 if successful, negative errno code if failure.
  */
-int t5838_wake_clear(const struct device *dev);
+int t5838_aad_wake_clear(const struct device *dev);
 
 /**
  * @brief Configure T5838 device into AAD A mode
  *
  * Function will configure and run T5838 AAD and configure interrupts on wake pin.
  *
- * @param dev Pointer to the device structure for the driver instance.
- * @param aadconf Pointer to the structure containing AAD A configuration
+ * @param[in] dev Pointer to the device structure for the driver instance.
+ * @param[in] aadconf Pointer to the structure containing AAD A configuration
  *
  * @return int 0 if successful, negative errno code if failure.
  */
@@ -231,8 +288,8 @@ int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadc
  *
  * Function will configure and run T5838 AAD and configure interrupts on wake pin.
  *
- * @param dev Pointer to the device structure for the driver instance.
- * @param aadconf Pointer to the structure containing AAD D configuration
+ * @param[in] dev Pointer to the device structure for the driver instance.
+ * @param[in] aadconf Pointer to the structure containing AAD D configuration
  *
  * @return int 0 if successful, negative errno code if failure.
  */
@@ -243,8 +300,8 @@ int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
  *
  * Function will configure and run T5838 AAD and configure interrupts on wake pin.
  *
- * @param dev Pointer to the device structure for the driver instance.
- * @param aadconf Pointer to the structure containing AAD D configuration
+ * @param[in] dev Pointer to the device structure for the driver instance.
+ * @param[in] aadconf Pointer to the structure containing AAD D configuration
  *
  * @return int 0 if successful, negative errno code if failure.
  */
@@ -255,7 +312,7 @@ int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
  *
  * Function will disable AAD functionality and disable interrupts on wake pin.
  *
- * @param dev Pointer to the device structure for the driver instance.
+ * @param[in] dev Pointer to the device structure for the driver instance.
  *
  * @return int 0 if successful, negative errno code if failure.
  */
@@ -264,11 +321,13 @@ int t5838_aad_mode_disable(const struct device *dev);
 /**
  * @brief Reset T5838 device using mic enable pin GPIO
  *
- * @param dev Pointer to the device structure for the driver instance.
+ * @param[in] dev Pointer to the device structure for the driver instance.
  *
  * @return int 0 if successful, negative errno code if failure.
  */
 int t5838_reset(const struct device *dev);
+
+#endif /* CONFIG_T5838_AAD_TRIGGER */
 
 #ifdef __cplusplus
 }

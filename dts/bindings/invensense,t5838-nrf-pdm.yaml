@@ -3,7 +3,7 @@
 
 description: T5838 microphone driver using modified Nordic PDM
 
-compatible: "tdk,t5838-nrf-pdm"
+compatible: "invensense,t5838-nrf-pdm"
 
 include: [base.yaml, pinctrl-device.yaml]
 
@@ -18,16 +18,16 @@ properties:
 
   thsel-gpios:
     type: phandle-array
-    required: false
+    required: true
     description: thsel pin
 
   wake-gpios:
     type: phandle-array
-    required: false
+    required: true
     description: wake pin
 
   pdmclk-gpios:
     type: phandle-array
-    required: false
+    required: true
     description: pdmclk pin
 
