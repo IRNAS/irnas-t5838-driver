@@ -14,6 +14,7 @@
 
 #include <hal/nrf_gpio.h>
 
+#include "version.h"
 #include <soc.h>
 
 LOG_MODULE_REGISTER(t5838, CONFIG_T5838_LOG_LEVEL);
@@ -28,7 +29,12 @@ BUILD_ASSERT(CONFIG_AUDIO_DMIC_NRFX_PDM == 0,
 
 static void free_buffer(struct t5838_drv_data *drv_data, void *buffer)
 {
-	k_mem_slab_free(drv_data->mem_slab, &buffer);
+	uint32_t kernelver = sys_kernel_version_get();
+	if (kernelver >= 0x3046300) {
+		k_mem_slab_free(drv_data->mem_slab, buffer);
+	} else {
+		k_mem_slab_free(drv_data->mem_slab, &buffer);
+	}
 	LOG_DBG("Freed buffer %p", buffer);
 }
 
@@ -102,8 +108,8 @@ static bool is_better(uint32_t freq, uint8_t ratio, uint32_t req_rate, uint32_t 
 	return false;
 }
 
-/** This function was modified to no longer check if we are using nrf52 and locking pdm clock to
- * discrete enumerated values */
+/** This function was modified to no longer check if we are using nrf52 and locking pdm
+ * clock to discrete enumerated values */
 static bool check_pdm_frequencies(const struct t5838_drv_cfg *drv_cfg, nrfx_pdm_config_t *config,
 				  const struct dmic_cfg *pdm_cfg, uint8_t ratio,
 				  uint32_t *best_diff, uint32_t *best_rate, uint32_t *best_freq)
@@ -198,8 +204,6 @@ static int t5838_configure(const struct device *dev, struct dmic_cfg *config)
 	uint32_t def_map, alt_map;
 	nrfx_pdm_config_t nrfx_cfg;
 	nrfx_err_t err;
-
-	// prv_configure_gpios(dev);
 
 	if (drv_data->active) {
 		LOG_ERR("Cannot configure device while it is active");
@@ -359,10 +363,6 @@ static int trigger_start(const struct device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_T5838_AAD_TRIGGER
-int prv_enter_sleep_with_AAD(const struct device *dev);
-#endif
-
 static int t5838_trigger(const struct device *dev, enum dmic_trigger cmd)
 {
 	struct t5838_drv_data *drv_data = dev->data;
@@ -374,10 +374,10 @@ static int t5838_trigger(const struct device *dev, enum dmic_trigger cmd)
 			drv_data->stopping = true;
 			nrfx_pdm_stop();
 		}
-#ifdef CONFIG_T5838_AAD_TRIGGER
 
+#ifdef CONFIG_T5838_AAD_TRIGGER
 		if (drv_data->aad_child_dev != NULL) {
-			prv_enter_sleep_with_AAD(drv_data->aad_child_dev);
+			t5838_aad_sleep(drv_data->aad_child_dev);
 		}
 #endif
 		break;
@@ -495,5 +495,6 @@ static const struct _dmic_ops t5838_dmic_ops = {
 			 &t5838_cfg##idx, POST_KERNEL, CONFIG_T5838_INIT_PRIORITY,                 \
 			 &t5838_dmic_ops);
 
-/* Existing SoCs only have one PDM instance - that is why we support only one instance of mic */
+/* Existing SoCs only have one PDM instance - that is why we support only one instance of
+ * mic */
 T5838_PDM_NRFX_DEVICE(0);

@@ -13,12 +13,12 @@
 extern "C" {
 #endif
 
-#include <stdint.h>
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/drivers/gpio.h>
 
 #include <nrfx_pdm.h>
 
-#include <zephyr/drivers/clock_control/nrf_clock_control.h>
-#include <zephyr/drivers/gpio.h>
+#include <stdint.h>
 
 #define T5838_REG_AAD_MODE			 0x29
 #define T5838_REG_AAD_D_FLOOR_HI		 0x2A
@@ -224,17 +224,6 @@ struct t5838_drv_cfg {
 };
 
 #ifdef CONFIG_T5838_AAD_TRIGGER
-struct t5838_aad_drv_data {
-
-	bool aad_unlocked;
-	enum t5838_aad_select aad_enabled_mode;
-
-	struct gpio_callback wake_cb;
-	bool cb_configured;
-	bool int_handled;
-	t5838_wake_handler_t wake_handler;
-};
-
 struct t5838_aad_drv_cfg {
 	const struct device *pdm_dev;
 
@@ -244,6 +233,19 @@ struct t5838_aad_drv_cfg {
 	const struct gpio_dt_spec wake;
 	const struct gpio_dt_spec thsel;
 	const struct gpio_dt_spec pdmclk;
+};
+
+struct t5838_aad_drv_data {
+
+	bool aad_unlocked;
+	enum t5838_aad_select aad_enabled_mode;
+
+	struct gpio_callback wake_cb;
+	bool cb_configured;
+	bool int_handled;
+	t5838_wake_handler_t wake_handler;
+
+	const struct t5838_aad_drv_cfg *aad_cfg;
 };
 #endif /* CONFIG_T5838_AAD_TRIGGER */
 
@@ -267,7 +269,8 @@ void t5838_aad_wake_handler_set(const struct device *dev, t5838_wake_handler_t h
  *
  * @param[in] dev Pointer to the device structure for the driver instance.
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_aad_wake_clear(const struct device *dev);
 
@@ -279,7 +282,8 @@ int t5838_aad_wake_clear(const struct device *dev);
  * @param[in] dev Pointer to the device structure for the driver instance.
  * @param[in] aadconf Pointer to the structure containing AAD A configuration
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadconf);
 
@@ -291,7 +295,8 @@ int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadc
  * @param[in] dev Pointer to the device structure for the driver instance.
  * @param[in] aadconf Pointer to the structure containing AAD D configuration
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf);
 
@@ -303,7 +308,8 @@ int t5838_aad_d1_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
  * @param[in] dev Pointer to the device structure for the driver instance.
  * @param[in] aadconf Pointer to the structure containing AAD D configuration
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aadconf);
 
@@ -314,7 +320,8 @@ int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
  *
  * @param[in] dev Pointer to the device structure for the driver instance.
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_aad_mode_disable(const struct device *dev);
 
@@ -323,9 +330,20 @@ int t5838_aad_mode_disable(const struct device *dev);
  *
  * @param[in] dev Pointer to the device structure for the driver instance.
  *
- * @return int 0 if successful, negative errno code if failure.
+ * @retval 0 if successful.
+ * @retval negative errno code if othewise.
  */
 int t5838_reset(const struct device *dev);
+
+/**
+ * @brief Function for putting T5838 into sleep mode with AAD is enabled. Must be called after
+ * writing to AAD registers.
+ *
+ * function clocks device for value set in T5838_ENTER_SLEEP_MODE_CLOCKING_TIME_US to enable AAD.
+ *
+ * @param[in] dev Pointer to the device structure for the driver instance.
+ */
+void t5838_aad_sleep(const struct device *dev);
 
 #endif /* CONFIG_T5838_AAD_TRIGGER */
 
