@@ -1,0 +1,1 @@
+add_subdirectory_ifdef(CONFIG_T5838 t5838)

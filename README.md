@@ -1,119 +1,78 @@
-# Irnas's Zephyr Project template
+# Irnas's T5838 PDM microphone driver
 
-IRNAS template for a GitHub repository. It comes with a
-[Zephyr group](https://github.com/IRNAS/irnas-workflows-software/tree/main/workflow-templates/zephyr)
-of CI workflows for release automation.
+This repository contains a driver for the T5838 PDM microphone. It is based on, and replaces the Zephyr PDM driver for nrf, but it has been modified to support the T5838 microphone.
 
-## Checklist
+Reason we are replacing the driver is that it doesn't allow us to set PDM frequency that is required by the microphone (see datasheet) and we need to use PDM CLK pin as a GPIO for setting AAD modes.
 
-- [ ] Provide a concise and accurate description of your project in the GitHub
-      "description" field.
-- [ ] Provide a concise and accurate description of your project in this
-      `README.md` file, replace the title.
-- [ ] Ensure that your project follows
-      [repository naming scheme](https://github.com/IRNAS/irnas-guidelines-docs/blob/dev/docs/github_projects_guidelines.md#repository-naming-scheme-).
-- [ ] Turn on `gitlint` tool by running `gitlint install-hook`. If you do not
-      have it yet, follow instructions
-      [here](https://github.com/IRNAS/irnas-guidelines-docs/tree/main/tools/gitlint).
-- [ ] Select the version of NCS in the `west.yaml` file, check the below section
-      for specifics.
-- [ ] Provide repository setup instructions, use template in _Setup_ section
-      below. Replace `<repo-name>`, `<board_name>`, and `<build_type>` as
-      appropriate for your project.
-- [ ] As the final step delete this checklist and commit changes.
+T5838 datasheet for more information can be found [here](https://invensense.tdk.com/wp-content/uploads/2023/06/DS-000383-T5838-Datasheet-v1.1.pdf).
 
 ## Setup
 
-If you do not already have them you will need to:
+1. To your `west.yml` add the IRNAS remote to the `remotes` section:
 
-- [install west](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/gs_installing.html#install-west)
-- [install east](https://github.com/IRNAS/irnas-east-software)
+   ```yaml
+   - name: irnas
+     url-base: https://github.com/irnas
+   ```
 
-Then follow these steps:
+2. Then in the `projects` section add at the bottom (select the revision you want to use):
 
-```shell
-west init -m https://github.com/IRNAS/<repo-name> <repo-name>
-cd <repo-name>/project
+   ```yaml
+   - name: irnas-t5838-driver
+      repo-path: irnas-t5838-driver
+      path: irnas/irnas-t5838-driver
+      remote: irnas
+      revision: <revision>
+   ```
 
-# set up east globally (this only needs to be done once on each machine)
-east sys-setup
-# install toolchain for the version of NCS used in this project
-east update toolchain
+3. Add the flash DTS entry to your board definition or overlay file. For example:
 
-# set up west modules in the repository
-east bypass -- west update
-```
+   ```dts
+   dmic_dev: &pdm0 {
+      status = "okay";
+      pinctrl-0 = <&pdm0_default>;
+      pinctrl-1 = <&pdm0_sleep>;
+      pinctrl-names = "default","sleep";
+      #address-cells = < 0x1 >;
+      #size-cells = < 0x0 >;
+      t5838: t5838@0 {
+         status = "okay";
+         compatible = "invensense,t5838-nrf-pdm";
+         micen-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+         thsel-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+         wake-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+         pdmclk-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
+         reg = <0x0>;
+      };
+   };
+   ```
 
-## Building and flashing
+   Note that since we are using dts entry pdm0 as a bus, we need to add the following to its definition:
 
-To build the application firmware:
+   ```dts
+   #address-cells = < 0x1 >;
+   #size-cells = < 0x0 >;
+   ```
 
-```bash
-cd app
-east build -b <board_name> -u <build_type>
-```
+   This tells the kernel that the bus has 1 address cell and 0 size cells. So we don't have to set reg value to full address of the device, but only the address of the device on the bus. Note that reg property is not currently used, as we currently only support one device on the bus and microphone proprietary protocol (I refer to it as fake2c communication) address is hardcoded in the driver header file (0x53 which is the only address microphone supports).
+   It is planed reg value will be used in the future to support two microphones on the same bus (stereo configuration).
 
-To flash the firmware:
+   Also note it is necessary to define all the gpios used by the microphone. The driver will not work without them. Clock pin must be defined in both pdm0 and t5838 node. Other pins are only defined in t5838 node.
 
-```bash
-east flash
-```
+4. Add the following to your `prj.conf` or whatever kconfig file you are using:
 
-To view RTT logs:
+   ```conf
+   CONFIG_AUDIO=y
+   CONFIG_AUDIO_DMIC=y
+   CONFIG_AUDIO_DMIC_NRFX_PDM=n
+   ```
 
-```bash
-# Run in first terminal window
-east util connect
+   This will enable audio subsystem, dmic driver and disable nrfx pdm driver. We must disable nrfx default pdm driver, because it is not compatible with our driver. If you don't disable it, you will get a compile error.
 
-# Run in second, new terminal window
-east util rtt
-```
+5. Don't forget to run `east clean` and `east update` before trying to build the project you are working on.
 
-## west.yaml and name-allowlist
+## Usage
 
-The manifest file (`west.yaml`) that comes with this template by default only
-allows certain modules from Nordic's `sdk-nrf` and `sdk-zephyr` repositories,
-while ignoring/blocking others.
+The driver is used in the same way zephyr pdm driver is used. The only difference is that you need to use your microphones node name instead of `pdm0`.
 
-This means that a setup on the new machine and in CI is faster as the
-`west update` command does not clone all modules from the mentioned repositories
-but only the ones that are needed.
-
-Manifest file only allows modules that are commonly used by IRNAS, however this
-can be easily changed by uncommenting the required modules and running
-`west update`.
-
-**IMPORTANT:** Such improvements do not come with some tradeoffs, there are now
-two things that a developer must take note of.
-
-### Compile time errors cause of blocked/missing headers
-
-If the application source code includes some headers from blocked/missing
-modules or if included headers use blocked/missing modules you will get an error
-that will complain about missing header files. In that case, you have to go to
-manifest file, find commented module, run `west update`, return to the app
-folder, delete build folder and build again.
-
-### Updating `sdk-nrf` version
-
-Whenever you want to update the version of `sdk-nrf` (also know simply as `NCS`)
-you need to keep one general thing in mind: you need to manually keep revisions
-of `sdk-nrf` and `sdk-zephyr` projects, as well as their imports in sync.
-
-1. Open `west.yml` file in `sdk-nrf` repository
-   ([link](https://github.com/nrfconnect/sdk-nrf)). Make sure that you select
-   correct tag from selection from top-left dropdown menu.
-2. Check what repos are under `sdk-zepyhr` project's `name-allowlist`, those
-   should match the repos in `west.yaml` of your project (and this template),
-   under `sdk-zepyhr` project's `name-allowlist`. Most of the time they should
-   be commented out, but depends.
-3. Check what other repositories appear under `sdk-zepyhr` project as standalone
-   projects, they start appearing around line 100, after `NCS repositories`
-   comment. This projects should match the repos in `west.yaml` of your project
-   (and this template), under `sdk-nrf` project's `name-allowlist`. Most of the
-   time they should be commented out, but again, this depends.
-
-When a new `sdk-nrf` version is released, some new repos as `NCS repositories`
-might appear or be moved into `sdk-zephyr`.
-
-After any change to the `west.yaml` do not forget to run `west update`.
+There are added functions that handle microphones AAD (acoustic activity detection) feature. API was designed to be as similar as possible to the API from vm3011 driver being used in other projects (since t5838 is to replace vm3011 in those projects).

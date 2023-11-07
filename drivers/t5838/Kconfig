@@ -1,0 +1,33 @@
+# Audio Codec configuration options
+
+# Copyright (c) 2018 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig T5838
+	bool "Digital Microphone (Audio) Drivers"
+	default y
+	depends on DT_HAS_INVENSENSE_T5838_NRF_PDM_ENABLED
+	select NRFX_PDM 
+	help
+	  Enable Digital Microphone Driver Configuration.
+
+if T5838
+
+module = T5838
+module-str = T5838 microphone driver for nrf-pdm
+source "subsys/logging/Kconfig.template.log_config"
+
+config T5838_INIT_PRIORITY
+	int "Init priority"
+	default 80
+	help
+	  Audio Digital Microphone device driver initialization priority.
+
+config T5838_AAD_TRIGGER
+	bool "Enable AAD functionality"
+	default n
+	help
+	  Enable AAD triggering functionality.
+
+endif # T5838
+

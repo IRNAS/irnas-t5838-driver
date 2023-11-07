@@ -1,19 +1,28 @@
-name: Build
+name: CodeChecker
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       checkout_ref:
+        description: "Commit to checkout"
         required: true
         type: string
+        default: main
+
   pull_request:
     types: [opened, reopened, synchronize]
+
   push:
     branches:
       - "main"
 
+env:
+  EAST_CODECHECKER_CI_MODE: 1
+  CODECHECKER_CREDENTIALS: ${{ secrets.CODECHECKER_CREDENTIALS }}
+  EAST_CODECHECKER_SERVER_URL: ${{ secrets.CODECHECKER_SERVER_URL }}
+
 jobs:
-  build:
+  codechecker:
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -44,13 +53,20 @@ jobs:
           ref: main
           path: project
 
+      - name: Add LLVM repositories
+        run: |
+          # If updating llvm version do not forget to update distro name
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-16 main"
+          sudo apt-get update
+
       - name: Install and cache apt packages
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: gcc-multilib
+          packages: clang-16 clang-tidy-16 cppcheck gcc-multilib
           # Update this manually when changing the packages above, increment
           # only minor version to keep APT caches separate.
-          version: 1.0
+          version: 3.0
 
       - name: Retrieve cache
         uses: actions/cache@v3
@@ -84,32 +100,39 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r scripts/requirements.txt
 
-      - name: Install project dependencies
+      - name: Install dependencies
         run: make install-dep
 
       - name: Setup project
         run: make project-setup
 
+      - name: Login to the server
+        run: |
+          echo $CODECHECKER_CREDENTIALS > ~/.codechecker.passwords.json
+          CodeChecker cmd login --url "${EAST_CODECHECKER_SERVER_URL}"
+
       - name: Pre-build
         run: make pre-build
 
-      - name: Quick build
-        if: github.event_name == 'push'
-        run: make quick-build
+      - name: Build
+        run: make codechecker-build
 
-      - name: Release
+      - name: Check
+        run: make codechecker-check
+
+      - name: Store
         if:
           github.event_name == 'workflow_dispatch' || github.event_name ==
-          'pull_request'
-        run: make release
+          'push'
+        run: make codechecker-store
 
-      - name: Pre-package
-        if: github.event_name == 'workflow_dispatch'
-        run: make pre-package
+      - name: Diff
+        if: github.event_name == 'pull_request'
+        run: make codechecker-diff
 
-      - name: Package artefacts
-        if: github.event_name == 'workflow_dispatch'
+      - name: Package diffs
+        if: ${{ always() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v3
         with:
-          name: artefacts
-          path: project/artefacts/*
+          name: codechecker-diffs
+          path: project/codechecker-diffs/*

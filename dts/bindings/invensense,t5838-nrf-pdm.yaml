@@ -1,0 +1,33 @@
+# Copyright (c) 2019 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+description: T5838 microphone driver using modified Nordic PDM
+
+compatible: "invensense,t5838-nrf-pdm"
+
+include: [base.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  micen-gpios:
+    type: phandle-array
+    required: false
+    description: thsel pin
+
+  thsel-gpios:
+    type: phandle-array
+    required: true
+    description: thsel pin
+
+  wake-gpios:
+    type: phandle-array
+    required: true
+    description: wake pin
+
+  pdmclk-gpios:
+    type: phandle-array
+    required: true
+    description: pdmclk pin
+
