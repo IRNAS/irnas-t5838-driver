@@ -73,6 +73,6 @@ T5838 datasheet for more information can be found [here](https://invensense.tdk.
 
 ## Usage
 
-The driver is used in the same way zephyr pdm driver is used. The only difference is that you need to use your microphones node name instead of `pdm0`.
+The driver is used in the same way zephyr pdm driver is used.
 
 There are added functions that handle microphones AAD (acoustic activity detection) feature. API was designed to be as similar as possible to the API from vm3011 driver being used in other projects (since t5838 is to replace vm3011 in those projects).
