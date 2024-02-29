@@ -38,7 +38,7 @@ pre-build:
 
 # Runs on every push to the main branch
 quick-build:
-	east build -b nrf52840dk_nrf52840 app
+	east build -b nrf52840dk_nrf52840 samples/dmic
 
 # Runs on every PR and when doing releases
 release:
