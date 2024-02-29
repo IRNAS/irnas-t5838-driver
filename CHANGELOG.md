@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+-   Remove `example_lib` (and by extension `tests/sample_test`), as it was causing 
+    linker errors in the projects that are importing `irnas-t5838-driver` project 
+    and also have `example_lib` in it.
+
 ## [0.1.0] - 2023-11-07
 
 ### Added
