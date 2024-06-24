@@ -29,12 +29,11 @@ BUILD_ASSERT(CONFIG_AUDIO_DMIC_NRFX_PDM == 0,
 
 static void free_buffer(struct t5838_drv_data *drv_data, void *buffer)
 {
-	uint32_t kernelver = sys_kernel_version_get();
-	if (kernelver >= 0x3046300) {
-		k_mem_slab_free(drv_data->mem_slab, buffer);
-	} else {
-		k_mem_slab_free(drv_data->mem_slab, &buffer);
-	}
+#if KERNEL_VERSION_NUMBER >= ZEPHYR_VERSION(3, 4, 99)
+	k_mem_slab_free(drv_data->mem_slab, buffer);
+#else
+	k_mem_slab_free(drv_data->mem_slab, &buffer);
+#endif
 	LOG_DBG("Freed buffer %p", buffer);
 }
 
