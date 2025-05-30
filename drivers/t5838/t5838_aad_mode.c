@@ -71,7 +71,7 @@ void prv_clock_bitbang(const struct device *dev, uint16_t cycles, uint16_t perio
  * @param[in] data Data to write to register.
  *
  * @retval 0 if successful.
- * @retval negative errno code if othewise.
+ * @retval negative errno code otherwise.
  */
 int prv_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
 {
@@ -82,6 +82,8 @@ int prv_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
 		LOG_ERR("Cannot write to device while pdm is active");
 		return -EBUSY;
 	}
+
+	LOG_DBG("prv_reg_write, reg: 0x%x, data: 0x%x", reg, data);
 
 	/**prepare data */
 	uint8_t wr_buf[] = {T5838_FAKE2C_DEVICE_ADDRESS << 1, reg, data};
@@ -136,7 +138,7 @@ int prv_reg_write(const struct device *dev, uint8_t reg, uint8_t data)
  * @param[in] num Number of address data pairs in data array.
  *
  * @retval 0 if successful.
- * @retval negative errno code if othewise.
+ * @retval negative errno code otherwise.
  */
 int prv_multi_reg_write(const struct device *dev, struct t5838_address_data_pair *data, uint8_t num)
 {
@@ -158,7 +160,7 @@ int prv_multi_reg_write(const struct device *dev, struct t5838_address_data_pair
  * @param[in] dev Pointer to the device structure for the driver instance.
  *
  * @retval 0 if successful.
- * @retval negative errno code if othewise.
+ * @retval negative errno code otherwise.
  */
 int prv_aad_unlock_sequence(const struct device *dev)
 {
@@ -258,7 +260,7 @@ void t5838_aad_wake_handler_set(const struct device *dev, t5838_wake_handler_t h
  * @param[in] write_array_size Size of write_array.
  *
  * @retval 0 if successful.
- * @retval negative errno code if othewise.
+ * @retval negative errno code if otherwise.
  */
 int prv_aad_mode_set(const struct device *dev, struct t5838_address_data_pair *write_array,
 		     uint8_t write_array_size)
@@ -337,13 +339,14 @@ int t5838_aad_a_mode_set(const struct device *dev, struct t5838_aad_a_conf *aadc
 		{T5838_REG_AAD_D_FLOOR_HI, (aadconf->aad_d_floor >> 8) & 0x1F},                    \
 		{T5838_REG_AAD_D_FLOOR_LO, aadconf->aad_d_floor & 0xFF},                           \
 		{0x2C, 0x32},                                                                      \
+		{0x2D, 0xC0},                                                                      \
 		{T5838_REG_AAD_D_REL_PULSE_MIN_LO, aadconf->aad_d_rel_pulse_min & 0xFF},           \
 		{T5838_REG_AAD_D_ABS_REL_PULSE_MIN_SHARED,                                         \
 		 ((aadconf->aad_d_abs_pulse_min >> 4) / 0xF0) |                                    \
 			 ((aadconf->aad_d_rel_pulse_min >> 8) & 0x0F)},                            \
 		{T5838_REG_AAD_D_ABS_PULSE_MIN_LO, aadconf->aad_d_abs_pulse_min & 0xFF},           \
 		{T5838_REG_AAD_D_ABS_THR_LO, aadconf->aad_d_abs_thr & 0xFF},                       \
-		{T5838_REG_AAD_D_ABS_THR_HI, ((aadconf->aad_d_abs_thr >> 8) & 0x1F) | 0x20},       \
+		{T5838_REG_AAD_D_ABS_THR_HI, ((aadconf->aad_d_abs_thr >> 8) & 0x1F) | 0x40},       \
 		{T5838_REG_AAD_D_REL_THR, aadconf->aad_d_rel_thr},                                 \
 		{T5838_REG_AAD_MODE, mode},                                                        \
 	}
@@ -372,7 +375,7 @@ int t5838_aad_d2_mode_set(const struct device *dev, struct t5838_aad_d_conf *aad
 		LOG_ERR("prv_aad_mode_set, err: %d", err);
 		return err;
 	}
-	drv_data->aad_enabled_mode = T5838_AAD_SELECT_D1;
+	drv_data->aad_enabled_mode = T5838_AAD_SELECT_D2;
 	return 0;
 }
 
@@ -407,7 +410,7 @@ int t5838_aad_mode_disable(const struct device *dev)
  * @param[in] dev Pointer to the device structure for the driver instance.
  *
  * @retval 0 if successful.
- * @retval negative errno code if othewise.
+ * @retval negative errno code if otherwise.
  */
 static int t5838_aad_init(const struct device *dev)
 {
